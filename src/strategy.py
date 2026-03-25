@@ -325,14 +325,14 @@ def generate_signals(
     swing_left: Optional[int] = None,
     swing_right: Optional[int] = None,
     atr_period: int = DEFAULT_ATR_PERIOD,
-    displacement_atr_mult: float = 1.25,
+    displacement_atr_mult: float = 0.8,
     displacement_bars: Optional[int] = None,
-    body_ratio_threshold: float = 0.60,
-    sweep_buffer_pct: float = DEFAULT_SWEEP_BUFFER_PCT,
+    body_ratio_threshold: float = 0.50,
+    sweep_buffer_pct: float = 0.0005,
     stop_buffer_pct: Optional[float] = None,
-    entry_max_distance_atr_mult: float = 0.75,
-    target_max_distance_atr_mult: float = 3.0,
-    min_rr: float = DEFAULT_MIN_RR,
+    entry_max_distance_atr_mult: float = 1.5,
+    target_max_distance_atr_mult: float = 5.0,
+    min_rr: float = 1.5,
 ) -> list[dict[str, Any]]:
     """
     Return liquidity-grab trade signals with RR >= `min_rr`.
@@ -358,7 +358,7 @@ def generate_signals(
         right = int(swing_right)
 
     if displacement_bars is None:
-        displacement_bars = max(5, right)
+        displacement_bars = 5
     displacement_bars = int(displacement_bars)
 
     if stop_buffer_pct is None:
@@ -372,7 +372,8 @@ def generate_signals(
         atr_period=atr_period,
         displacement_atr_mult=displacement_atr_mult,
         displacement_bars=displacement_bars,
-        require_close_move=True,
+        # Use wick-based displacement to avoid missing setups due to strict close-based rules.
+        require_close_move=False,
     )
 
     low_positions = np.flatnonzero(respected_low.to_numpy())
@@ -425,7 +426,8 @@ def generate_signals(
         close_to_sweep_ok_for_short = True
 
         # LONG setup: sweep below last respected swing low + bullish strong candle.
-        if bias == "bullish":
+        # Allow HTF neutral for initial calibration.
+        if bias in {"bullish", "neutral"}:
             last_low = _last_position_at_or_before(low_positions, low_values, confirm_threshold)
             if last_low is not None:
                 swept_pos, swept_level = last_low
@@ -479,7 +481,8 @@ def generate_signals(
                             )
 
         # SHORT setup: sweep above last respected swing high + bearish strong candle.
-        if bias == "bearish":
+        # Allow HTF neutral for initial calibration.
+        if bias in {"bearish", "neutral"}:
             last_high = _last_position_at_or_before(high_positions, high_values, confirm_threshold)
             if last_high is not None:
                 swept_pos, swept_level = last_high
