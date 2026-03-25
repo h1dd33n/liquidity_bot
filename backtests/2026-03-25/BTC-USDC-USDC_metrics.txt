@@ -1,0 +1,11 @@
+symbol: BTC/USDC:USDC
+timeframe: 15m
+htf_timeframe: 1h
+years: 2.0
+initial_equity: 1000.0
+final_equity: 982.970695655686
+max_drawdown: 18.26219695722989
+num_trades: 142
+wins: 21
+losses: 121
+profit_factor: 0.5615077456011437

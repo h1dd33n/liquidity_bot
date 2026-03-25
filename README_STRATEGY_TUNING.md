@@ -10,7 +10,7 @@ This document lists the tuning knobs that affect signal frequency vs selectivity
 These correspond to `generate_signals()` parameters in `src/strategy.py`:
 
 ### Respected swing / displacement filter
-- `displacement_atr_mult` (float, default `0.8`)
+- `displacement_atr_mult` (float, default `1.0`)
   - A swing is only considered “respected” if price moves away by at least:
     `displacement_atr_mult * ATR` after the swing is touched.
 - `displacement_bars` (int or None, default `5`)
@@ -18,12 +18,12 @@ These correspond to `generate_signals()` parameters in `src/strategy.py`:
   - If set to `None`, it falls back to `5`.
 
 ### Liquidity sweep threshold
-- `sweep_buffer_pct` (float, default `0.0005`)
+- `sweep_buffer_pct` (float, default `0.001`)
   - LONG sweep: `low < swing_low * (1 - sweep_buffer_pct)`
   - SHORT sweep: `high > swing_high * (1 + sweep_buffer_pct)`
 
 ### Strong reversal confirmation
-- `body_ratio_threshold` (float, default `0.50`)
+- `body_ratio_threshold` (float, default `0.55`)
   - Confirmation requires candle body strength:
     `abs(close-open) / (high-low) > body_ratio_threshold`
 
@@ -37,13 +37,15 @@ These correspond to `generate_signals()` parameters in `src/strategy.py`:
     `target_dist > target_max_distance_atr_mult * ATR`
 
 ### Minimum reward-to-risk
-- `min_rr` (float, default `1.5` for calibration)
+- `min_rr` (float, default `2.0`)
   - Signals are discarded if computed `RR < min_rr`.
   - When you’re ready for stricter playbook compliance, increase back toward `2.0`.
 
 ## HTF bias gate
-Current behavior (for calibration):
-- HTF bias `"neutral"` is treated as allowing both LONG and SHORT gating (so you can find signals).
+Behavior:
+- HTF bias `"neutral"` is treated as allowing both LONG and SHORT gating only when
+  `allow_neutral_htf_in_backtest=True` (backtest calibration).
+- For live trading, keep `allow_neutral_htf_in_backtest=False` so bias is required.
 
 If you want stricter structure-first compliance later, change those conditions back to:
 - LONG only when HTF bias is `"bullish"`

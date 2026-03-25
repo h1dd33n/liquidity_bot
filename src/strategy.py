@@ -1,8 +1,6 @@
 """
-Pure liquidity-grab / liquidity-sweep strategy logic.
-
-This module is intentionally exchange-agnostic: it consumes OHLCV pandas DataFrames
-and returns structured signal dicts for the rest of the bot to execute/backtest.
+Pure liquidity-grab / liquidity-sweep strategy logic (fixed version).
+No RR prediction inside strategy — only liquidity-based targets.
 """
 
 from __future__ import annotations
@@ -16,7 +14,6 @@ import pandas as pd
 import pandas_ta as ta
 
 try:
-    # config/ has no __init__.py, but Python namespace packages still allow this import in most cases.
     from config.settings import (
         ATR_PERIOD as DEFAULT_ATR_PERIOD,
         MIN_RR as DEFAULT_MIN_RR,
@@ -24,7 +21,6 @@ try:
         SWING_LOOKBACK as DEFAULT_SWING_LOOKBACK,
     )
 except Exception:
-    # Safe fallbacks so the strategy can run in isolation.
     DEFAULT_ATR_PERIOD = 14
     DEFAULT_MIN_RR = 2.0
     DEFAULT_SWEEP_BUFFER_PCT = 0.001
@@ -43,24 +39,14 @@ def _require_columns(df: pd.DataFrame, cols: tuple[str, ...]) -> None:
 def _compute_atr(df: pd.DataFrame, atr_period: int) -> pd.Series:
     _require_columns(df, ("high", "low", "close"))
     atr = ta.atr(high=df["high"], low=df["low"], close=df["close"], length=atr_period)
-    # pandas_ta commonly names it ATR_{length}, but be defensive.
     if isinstance(atr, pd.Series):
         return atr.rename("atr")
     if isinstance(atr, pd.DataFrame):
-        if atr.shape[1] != 1:
-            raise ValueError("Unexpected ATR output shape from pandas_ta.")
         return atr.iloc[:, 0].rename("atr")
-    raise ValueError("Unexpected ATR output type from pandas_ta.")
+    raise ValueError("Unexpected ATR output from pandas_ta.")
 
 
 def detect_swings(df: pd.DataFrame, left: int = 5, right: int = 5) -> pd.DataFrame:
-    """
-    Detect swing highs/lows using a centered rolling-window fractal.
-
-    Note: swing identification uses future bars (because it's centered). When generating
-    signals, we therefore gate by `swing_right` and `displacement_bars` so no lookahead
-    is used.
-    """
     _require_columns(df, ("high", "low"))
     out = df.copy()
     window = left + right + 1
@@ -77,12 +63,13 @@ def _compute_respected_swings(
     atr_period: int,
     displacement_atr_mult: float,
     displacement_bars: int,
-    require_close_move: bool = True,
+    require_close_move: bool = False,
 ) -> tuple[pd.Series, pd.Series]:
     """
-    Respect filter (playbook rule):
-    - A swing is "respected" only if price moved away at least `displacement_atr_mult * ATR`
-      after touching it.
+    Respected swing filter (playbook rule):
+    - A swing is respected if price moved away by at least:
+        displacement_atr_mult * ATR
+      within the next `displacement_bars` after touching the swing.
     """
     _require_columns(df, _REQUIRED_OHLCV_COLUMNS)
     atr = _compute_atr(df, atr_period)
@@ -91,7 +78,6 @@ def _compute_respected_swings(
     respected_low = pd.Series(False, index=df.index)
     respected_high = pd.Series(False, index=df.index)
 
-    # Iterate only over swing candidates (usually far fewer than all bars).
     swing_low_positions = np.flatnonzero(swings["swing_low"].to_numpy())
     swing_high_positions = np.flatnonzero(swings["swing_high"].to_numpy())
 
@@ -100,39 +86,40 @@ def _compute_respected_swings(
     closes = df["close"].to_numpy()
 
     for pos in swing_low_positions:
-        atr_s = atr.iloc[pos]
-        if pd.isna(atr_s) or atr_s <= 0:
+        atr_s = float(atr.iloc[pos])
+        if not np.isfinite(atr_s) or atr_s <= 0:
             continue
-        # Need future bars to confirm "move away".
+
         end = pos + 1 + displacement_bars
         if end > len(df):
             continue
 
-        touched = lows[pos]
+        touched = float(lows[pos])
         max_high_after = float(np.max(highs[pos + 1 : end]))
-        if (max_high_after - touched) < displacement_atr_mult * float(atr_s):
+        if (max_high_after - touched) < float(displacement_atr_mult) * atr_s:
             continue
         if require_close_move:
             max_close_after = float(np.max(closes[pos + 1 : end]))
-            if (max_close_after - touched) < displacement_atr_mult * float(atr_s):
+            if (max_close_after - touched) < float(displacement_atr_mult) * atr_s:
                 continue
         respected_low.iloc[pos] = True
 
     for pos in swing_high_positions:
-        atr_s = atr.iloc[pos]
-        if pd.isna(atr_s) or atr_s <= 0:
+        atr_s = float(atr.iloc[pos])
+        if not np.isfinite(atr_s) or atr_s <= 0:
             continue
+
         end = pos + 1 + displacement_bars
         if end > len(df):
             continue
 
-        touched = highs[pos]
+        touched = float(highs[pos])
         min_low_after = float(np.min(lows[pos + 1 : end]))
-        if (touched - min_low_after) < displacement_atr_mult * float(atr_s):
+        if (touched - min_low_after) < float(displacement_atr_mult) * atr_s:
             continue
         if require_close_move:
             min_close_after = float(np.min(closes[pos + 1 : end]))
-            if (touched - min_close_after) < displacement_atr_mult * float(atr_s):
+            if (touched - min_close_after) < float(displacement_atr_mult) * atr_s:
                 continue
         respected_high.iloc[pos] = True
 
@@ -140,10 +127,6 @@ def _compute_respected_swings(
 
 
 def _body_ratio(df: pd.DataFrame, i: int) -> float:
-    """
-    Candle body ratio: body / range.
-    Used as the "strong reversal" confirmation (>= 0.60 by default).
-    """
     o = float(df["open"].iloc[i])
     c = float(df["close"].iloc[i])
     h = float(df["high"].iloc[i])
@@ -152,35 +135,11 @@ def _body_ratio(df: pd.DataFrame, i: int) -> float:
     return abs(c - o) / rng
 
 
-def _calculate_signal_metrics(
-    *,
-    direction: str,
-    entry_price: float,
-    stop_loss: float,
-    target_price: float,
-    min_rr: float,
-) -> dict[str, Any]:
-    if direction not in {"LONG", "SHORT"}:
-        raise ValueError("direction must be 'LONG' or 'SHORT'")
-
-    if direction == "LONG":
-        stop_dist = float(entry_price - stop_loss)
-        target_dist = float(target_price - entry_price)
-    else:
-        stop_dist = float(stop_loss - entry_price)
-        target_dist = float(entry_price - target_price)
-
-    if stop_dist <= 0 or target_dist <= 0:
-        return {"valid": False, "rr_ratio": None, "stop_distance": stop_dist, "target_distance": target_dist}
-
-    rr = target_dist / stop_dist
-    if rr < min_rr:
-        return {"valid": False, "rr_ratio": rr, "stop_distance": stop_dist, "target_distance": target_dist}
-
-    return {"valid": True, "rr_ratio": rr, "stop_distance": stop_dist, "target_distance": target_dist}
-
-
-def _last_position_at_or_before(positions: np.ndarray, values: np.ndarray, threshold_pos: int) -> Optional[tuple[int, float]]:
+def _last_position_at_or_before(
+    positions: np.ndarray,
+    values: np.ndarray,
+    threshold_pos: int,
+) -> Optional[tuple[int, float]]:
     if positions.size == 0:
         return None
     idx = bisect_right(positions.tolist(), threshold_pos) - 1
@@ -189,7 +148,7 @@ def _last_position_at_or_before(positions: np.ndarray, values: np.ndarray, thres
     return int(positions[idx]), float(values[idx])
 
 
-def _find_nearest_opposing_swing(
+def _find_nearest_opposing_swing(   # simplified — no RR check here
     *,
     direction: str,
     threshold_pos: int,
@@ -197,39 +156,28 @@ def _find_nearest_opposing_swing(
     atr_i: float,
     swing_positions: np.ndarray,
     swing_levels: np.ndarray,
-    target_max_distance_atr_mult: float,
+    target_max_distance_atr_mult: float = 8.0,
 ) -> Optional[tuple[int, float]]:
-    """
-    Target rule (your requirement):
-    - LONG: nearest previous respected swing HIGH that is above entry_price.
-    - SHORT: nearest previous respected swing LOW that is below entry_price.
-    """
+    """Return nearest previous respected opposing swing (liquidity pool)."""
     if direction not in {"LONG", "SHORT"}:
         raise ValueError("direction must be 'LONG' or 'SHORT'")
 
-    # Start from the nearest previous swing (pos <= threshold_pos) and walk backward until it fits constraints.
     idx = bisect_right(swing_positions.tolist(), threshold_pos) - 1
     if idx < 0:
         return None
 
     max_dist = float(target_max_distance_atr_mult) * float(atr_i)
+
     while idx >= 0:
         pos = int(swing_positions[idx])
         level = float(swing_levels[idx])
         if direction == "LONG":
-            if level > entry_price:
-                dist = level - entry_price
-                if dist <= max_dist:
-                    return pos, level
-                # If even this nearest candidate is too far, earlier ones are likely also too far,
-                # but not guaranteed; keep scanning a bit.
-        else:
-            if level < entry_price:
-                dist = entry_price - level
-                if dist <= max_dist:
-                    return pos, level
+            if level > entry_price and (level - entry_price) <= max_dist:
+                return pos, level
+        else:  # SHORT
+            if level < entry_price and (entry_price - level) <= max_dist:
+                return pos, level
         idx -= 1
-
     return None
 
 
@@ -243,11 +191,14 @@ def _compute_market_structure_bias(
     displacement_bars: int,
 ) -> pd.Series:
     """
-    HTF bias (your requirement):
-    - Bullish if last two swing highs are higher highs and last two swing lows are higher lows.
-    - Bearish if last two swing highs are lower highs and last two swing lows are lower lows.
+    HTF bias (structure-first):
+    - bullish: last two respected swing highs are higher highs AND last two
+               respected swing lows are higher lows.
+    - bearish: last two respected swing highs are lower highs AND last two
+               respected swing lows are lower lows.
     """
     _require_columns(htf_df, _REQUIRED_OHLCV_COLUMNS)
+
     respected_low, respected_high = _compute_respected_swings(
         htf_df,
         left=left,
@@ -255,8 +206,9 @@ def _compute_market_structure_bias(
         atr_period=atr_period,
         displacement_atr_mult=displacement_atr_mult,
         displacement_bars=displacement_bars,
-        require_close_move=True,
+        require_close_move=False,
     )
+
     bias = pd.Series("neutral", index=htf_df.index, dtype=object)
 
     atr_confirm_bars = max(right, displacement_bars)
@@ -270,6 +222,7 @@ def _compute_market_structure_bias(
 
     hi_ptr = 0
     lo_ptr = 0
+
     for cur_pos in range(len(htf_df)):
         threshold = cur_pos - atr_confirm_bars
         while hi_ptr < len(highs_positions) and int(highs_positions[hi_ptr]) <= threshold:
@@ -295,12 +248,13 @@ def _compute_market_structure_bias(
 
 
 def _map_htf_bias_to_base(
-    base_df: pd.DataFrame, htf_df: pd.DataFrame, htf_bias: pd.Series
+    base_df: pd.DataFrame,
+    htf_df: pd.DataFrame,
+    htf_bias: pd.Series,
 ) -> pd.Series:
     """
-    Map HTF bias series onto base timeframe rows.
-
-    Requires both DataFrames to have DatetimeIndex for correct alignment.
+    Map HTF bias series onto base timeframe rows by taking the most recent
+    HTF timestamp <= base timestamp.
     """
     if not isinstance(base_df.index, pd.DatetimeIndex) or not isinstance(htf_df.index, pd.DatetimeIndex):
         raise ValueError("htf_df and df must both have DatetimeIndex for HTF bias alignment.")
@@ -308,13 +262,14 @@ def _map_htf_bias_to_base(
     base_times = base_df.index.view("i8")
     htf_times = htf_df.index.view("i8")
 
-    # For each base time, take the most recent HTF time <= base time.
     positions = np.searchsorted(htf_times, base_times, side="right") - 1
     mapped = np.empty(len(base_df), dtype=object)
     mapped[:] = "neutral"
+
     valid = positions >= 0
     if np.any(valid):
         mapped[valid] = htf_bias.iloc[positions[valid]].to_numpy()
+
     return pd.Series(mapped, index=base_df.index, dtype=object)
 
 
@@ -325,54 +280,48 @@ def generate_signals(
     swing_left: Optional[int] = None,
     swing_right: Optional[int] = None,
     atr_period: int = DEFAULT_ATR_PERIOD,
-    displacement_atr_mult: float = 0.8,
+    displacement_atr_mult: float = 1.0,
     displacement_bars: Optional[int] = None,
-    body_ratio_threshold: float = 0.50,
-    sweep_buffer_pct: float = 0.0005,
+    body_ratio_threshold: float = 0.55,
+    sweep_buffer_pct: float = DEFAULT_SWEEP_BUFFER_PCT,
     stop_buffer_pct: Optional[float] = None,
-    entry_max_distance_atr_mult: float = 1.5,
-    target_max_distance_atr_mult: float = 5.0,
-    min_rr: float = 1.5,
+    entry_max_distance_atr_mult: float = 0.8,
+    target_max_distance_atr_mult: float = 8.0,
+    min_rr: float = DEFAULT_MIN_RR,  # used only for rr_ratio metadata (risk_manager enforces actual filtering)
+    allow_neutral_htf_in_backtest: bool = False,
+    debug: bool = False,
 ) -> list[dict[str, Any]]:
-    """
-    Return liquidity-grab trade signals with RR >= `min_rr`.
-
-    Signal dict keys:
-    - direction: "LONG" | "SHORT"
-    - entry_price, stop_loss, target_price, rr_ratio
-    - swept_level, swing_level_swept_index
-    - target_swing_level, target_swing_index
-    - atr, htf_bias, candle_body_ratio, and other metadata
-    """
     _require_columns(df, _REQUIRED_OHLCV_COLUMNS)
     if len(df) < 50:
         return []
 
     if swing_left is None or swing_right is None:
-        # Map configured swing lookback into a workable left/right window.
         total_window = int(DEFAULT_SWING_LOOKBACK)
-        left = max(2, total_window // 2)
-        right = max(2, total_window // 2)
-    else:
-        left = int(swing_left)
-        right = int(swing_right)
+        swing_left = max(2, total_window // 2)
+        swing_right = max(2, total_window // 2)
+
+    left = int(swing_left)
+    right = int(swing_right)
 
     if displacement_bars is None:
         displacement_bars = 5
     displacement_bars = int(displacement_bars)
 
     if stop_buffer_pct is None:
-        stop_buffer_pct = sweep_buffer_pct
+        stop_buffer_pct = abs(float(sweep_buffer_pct))
+        if stop_buffer_pct == 0:
+            stop_buffer_pct = float(DEFAULT_SWEEP_BUFFER_PCT)
+    stop_buffer_pct = float(stop_buffer_pct)
 
     atr = _compute_atr(df, atr_period)
+
     respected_low, respected_high = _compute_respected_swings(
         df,
         left=left,
         right=right,
         atr_period=atr_period,
-        displacement_atr_mult=displacement_atr_mult,
-        displacement_bars=displacement_bars,
-        # Use wick-based displacement to avoid missing setups due to strict close-based rules.
+        displacement_atr_mult=float(displacement_atr_mult),
+        displacement_bars=int(displacement_bars),
         require_close_move=False,
     )
 
@@ -381,39 +330,56 @@ def generate_signals(
     high_positions = np.flatnonzero(respected_high.to_numpy())
     high_values = df["high"].to_numpy()[high_positions]
 
-    # HTF bias gating (structure-first).
+    # HTF bias (structure-first). For calibration, allow neutral to pass.
     if htf_df is not None:
         htf_bias = _compute_market_structure_bias(
             htf_df,
             left=left,
             right=right,
             atr_period=atr_period,
-            displacement_atr_mult=displacement_atr_mult,
-            displacement_bars=displacement_bars,
+            displacement_atr_mult=float(displacement_atr_mult),
+            displacement_bars=int(displacement_bars),
         )
         base_bias = _map_htf_bias_to_base(df, htf_df, htf_bias)
     else:
         base_bias = pd.Series("neutral", index=df.index, dtype=object)
 
-    swing_confirm_bars = max(right, displacement_bars)
-    start_pos = max(swing_confirm_bars + 1, atr_period + 1)
+    # We cannot safely reference swings earlier than the swing-right horizon.
+    start_pos = max(int(atr_period) + int(right) + int(displacement_bars), 50)
+
+    opens = df["open"].to_numpy()
+    closes = df["close"].to_numpy()
+    highs = df["high"].to_numpy()
+    lows = df["low"].to_numpy()
 
     signals: list[dict[str, Any]] = []
-    closes = df["close"].to_numpy()
-    opens = df["open"].to_numpy()
-    lows = df["low"].to_numpy()
-    highs = df["high"].to_numpy()
+
+    # Debug counters to understand why signals are (or aren't) produced.
+    long_sweeps = 0
+    long_reversals = 0
+    long_sweep_reversals = 0
+    long_target_search_attempts = 0
+    long_targets_none = 0
+    long_targets_found = 0
+    long_chase_rejects = 0
+
+    short_sweeps = 0
+    short_reversals = 0
+    short_sweep_reversals = 0
+    short_target_search_attempts = 0
+    short_targets_none = 0
+    short_targets_found = 0
+    short_chase_rejects = 0
 
     for i in range(start_pos, len(df)):
+        pivot_threshold_pos = i - right
+        if pivot_threshold_pos < 0:
+            continue
+
         atr_i = float(atr.iloc[i])
         if not np.isfinite(atr_i) or atr_i <= 0:
             continue
 
-        confirm_threshold = i - swing_confirm_bars
-        if confirm_threshold < 0:
-            continue
-
-        candle_body_ratio = float(_body_ratio(df, i))
         o = float(opens[i])
         c = float(closes[i])
         h = float(highs[i])
@@ -421,116 +387,180 @@ def generate_signals(
         if h - l <= 0:
             continue
 
-        bias = str(base_bias.iloc[i])
-        close_to_sweep_ok_for_long = True
-        close_to_sweep_ok_for_short = True
+        candle_body_ratio = float(_body_ratio(df, i))
+        bias = str(base_bias.iloc[i]) if htf_df is not None else "neutral"
 
-        # LONG setup: sweep below last respected swing low + bullish strong candle.
-        # Allow HTF neutral for initial calibration.
-        if bias in {"bullish", "neutral"}:
-            last_low = _last_position_at_or_before(low_positions, low_values, confirm_threshold)
+        allow_long = False
+        allow_short = False
+        if bias == "bullish":
+            allow_long = True
+        elif bias == "bearish":
+            allow_short = True
+        else:
+            if allow_neutral_htf_in_backtest:
+                allow_long = True
+                allow_short = True
+
+        # LONG setup
+        if allow_long:
+            last_low = _last_position_at_or_before(low_positions, low_values, pivot_threshold_pos)
             if last_low is not None:
                 swept_pos, swept_level = last_low
-                swept = l < swept_level * (1.0 - sweep_buffer_pct)
-                reversal = (c > o) and (candle_body_ratio > body_ratio_threshold)
+                swept = l < float(swept_level) * (1.0 - float(sweep_buffer_pct))
+                # Reversal must reclaim the swept liquidity level,
+                # otherwise the stop can end up almost on top of entry.
+                reversal = (c > o) and (c > float(swept_level)) and (candle_body_ratio > float(body_ratio_threshold))
                 if swept and reversal:
-                    entry_price = c  # enter on close of confirmation candle
-                    # Enter "near" the swept level (avoid chasing).
-                    if (entry_price - swept_level) > entry_max_distance_atr_mult * atr_i:
-                        close_to_sweep_ok_for_long = False
-                    # Stop should be beyond the sweep candle extreme (tighter but safe).
-                    stop_loss = l * (1.0 - stop_buffer_pct)
+                    long_sweeps += 1
+                    long_reversals += 1
+                    long_sweep_reversals += 1
 
-                    target = _find_nearest_opposing_swing(
-                        direction="LONG",
-                        threshold_pos=confirm_threshold,
-                        entry_price=entry_price,
-                        atr_i=atr_i,
-                        swing_positions=high_positions,
-                        swing_levels=high_values,
-                        target_max_distance_atr_mult=target_max_distance_atr_mult,
-                    )
-                    if close_to_sweep_ok_for_long and target is not None:
-                        target_pos, target_level = target
-                        metrics = _calculate_signal_metrics(
-                            direction="LONG",
-                            entry_price=entry_price,
-                            stop_loss=stop_loss,
-                            target_price=target_level,
-                            min_rr=min_rr,
-                        )
-                        if metrics["valid"]:
-                            signals.append(
-                                {
-                                    "direction": "LONG",
-                                    "signal_index": df.index[i],
-                                    "entry_price": float(entry_price),
-                                    "stop_loss": float(stop_loss),
-                                    "target_price": float(target_level),
-                                    "rr_ratio": float(metrics["rr_ratio"]),
-                                    "atr": float(atr_i),
-                                    "htf_bias": bias,
-                                    "candle_body_ratio": float(candle_body_ratio),
-                                    "swing_level_swept": float(swept_level),
-                                    "swing_level_swept_index": df.index[swept_pos],
-                                    "target_swing_level": float(target_level),
-                                    "target_swing_index": df.index[target_pos],
-                                    "sweep_buffer_pct": float(sweep_buffer_pct),
-                                    "displacement_atr_mult": float(displacement_atr_mult),
-                                }
+                    entry_price = float(c)
+                    if (entry_price - float(swept_level)) > float(entry_max_distance_atr_mult) * atr_i:
+                        long_chase_rejects += 1
+                        # Too far from liquidity: do not take this setup.
+                    else:
+                        stop_loss = float(swept_level) * (1.0 - stop_buffer_pct)
+                        if stop_loss < entry_price:
+                            long_target_search_attempts += 1
+                            target = _find_nearest_opposing_swing(
+                                direction="LONG",
+                                threshold_pos=pivot_threshold_pos,
+                                entry_price=entry_price,
+                                atr_i=atr_i,
+                                swing_positions=high_positions,
+                                swing_levels=high_values,
+                                target_max_distance_atr_mult=float(target_max_distance_atr_mult),
                             )
+                            if target is not None:
+                                target_pos, target_level = target
+                                long_targets_found += 1
+                                rr = (float(target_level) - entry_price) / (entry_price - float(stop_loss))
+                                signals.append(
+                                    {
+                                        "direction": "LONG",
+                                        "signal_index": df.index[i],
+                                        "entry_price": float(entry_price),
+                                        "stop_loss": float(stop_loss),
+                                        "target_price": float(target_level),
+                                        "rr_ratio": float(rr),
+                                        "atr": float(atr_i),
+                                        "htf_bias": bias,
+                                        "candle_body_ratio": float(candle_body_ratio),
+                                        "swing_level_swept": float(swept_level),
+                                        "swing_level_swept_index": df.index[swept_pos],
+                                        "target_swing_level": float(target_level),
+                                        "target_swing_index": df.index[target_pos],
+                                        "displacement_atr_mult": float(displacement_atr_mult),
+                                        "displacement_bars": int(displacement_bars),
+                                        "sweep_buffer_pct": float(sweep_buffer_pct),
+                                    }
+                                )
+                            else:
+                                long_targets_none += 1
+                                if debug and long_targets_none <= 1:
+                                    # Candidate diagnostics: count highs above entry that are within distance.
+                                    within_mask = (
+                                        (high_positions <= pivot_threshold_pos)
+                                        & (high_values > entry_price)
+                                        & ((high_values - entry_price) <= float(target_max_distance_atr_mult) * atr_i)
+                                    )
+                                    num_cands = int(within_mask.sum())
+                                    max_cand = float(np.max(high_values[within_mask])) if num_cands > 0 else None
+                                    print(
+                                        f"DEBUG TARGET LONG NONE: i={i} swept_level={float(swept_level)} entry={entry_price} atr={atr_i} "
+                                        f"cands_within={num_cands} max_cand={max_cand}"
+                                    )
 
-        # SHORT setup: sweep above last respected swing high + bearish strong candle.
-        # Allow HTF neutral for initial calibration.
-        if bias in {"bearish", "neutral"}:
-            last_high = _last_position_at_or_before(high_positions, high_values, confirm_threshold)
+        # SHORT setup
+        if allow_short:
+            last_high = _last_position_at_or_before(high_positions, high_values, pivot_threshold_pos)
             if last_high is not None:
                 swept_pos, swept_level = last_high
-                swept = h > swept_level * (1.0 + sweep_buffer_pct)
-                reversal = (c < o) and (candle_body_ratio > body_ratio_threshold)
+                swept = h > float(swept_level) * (1.0 + float(sweep_buffer_pct))
+                # For SHORT, the confirmation candle must reclaim below swept level.
+                reversal = (c < o) and (c < float(swept_level)) and (candle_body_ratio > float(body_ratio_threshold))
                 if swept and reversal:
-                    entry_price = c
-                    if (swept_level - entry_price) > entry_max_distance_atr_mult * atr_i:
-                        close_to_sweep_ok_for_short = False
-                    stop_loss = h * (1.0 + stop_buffer_pct)
+                    short_sweeps += 1
+                    short_reversals += 1
+                    short_sweep_reversals += 1
 
-                    target = _find_nearest_opposing_swing(
-                        direction="SHORT",
-                        threshold_pos=confirm_threshold,
-                        entry_price=entry_price,
-                        atr_i=atr_i,
-                        swing_positions=low_positions,
-                        swing_levels=low_values,
-                        target_max_distance_atr_mult=target_max_distance_atr_mult,
-                    )
-                    if close_to_sweep_ok_for_short and target is not None:
-                        target_pos, target_level = target
-                        metrics = _calculate_signal_metrics(
-                            direction="SHORT",
-                            entry_price=entry_price,
-                            stop_loss=stop_loss,
-                            target_price=target_level,
-                            min_rr=min_rr,
-                        )
-                        if metrics["valid"]:
-                            signals.append(
-                                {
-                                    "direction": "SHORT",
-                                    "signal_index": df.index[i],
-                                    "entry_price": float(entry_price),
-                                    "stop_loss": float(stop_loss),
-                                    "target_price": float(target_level),
-                                    "rr_ratio": float(metrics["rr_ratio"]),
-                                    "atr": float(atr_i),
-                                    "htf_bias": bias,
-                                    "candle_body_ratio": float(candle_body_ratio),
-                                    "swing_level_swept": float(swept_level),
-                                    "swing_level_swept_index": df.index[swept_pos],
-                                    "target_swing_level": float(target_level),
-                                    "target_swing_index": df.index[target_pos],
-                                    "sweep_buffer_pct": float(sweep_buffer_pct),
-                                    "displacement_atr_mult": float(displacement_atr_mult),
-                                }
+                    entry_price = float(c)
+                    if (float(swept_level) - entry_price) > float(entry_max_distance_atr_mult) * atr_i:
+                        short_chase_rejects += 1
+                        # Too far from liquidity: do not take this setup.
+                    else:
+                        stop_loss = float(swept_level) * (1.0 + stop_buffer_pct)
+                        if stop_loss > entry_price:
+                            short_target_search_attempts += 1
+                            target = _find_nearest_opposing_swing(
+                                direction="SHORT",
+                                threshold_pos=pivot_threshold_pos,
+                                entry_price=entry_price,
+                                atr_i=atr_i,
+                                swing_positions=low_positions,
+                                swing_levels=low_values,
+                                target_max_distance_atr_mult=float(target_max_distance_atr_mult),
                             )
+                            if target is not None:
+                                target_pos, target_level = target
+                                short_targets_found += 1
+                                rr = (entry_price - float(target_level)) / (float(stop_loss) - entry_price)
+                                signals.append(
+                                    {
+                                        "direction": "SHORT",
+                                        "signal_index": df.index[i],
+                                        "entry_price": float(entry_price),
+                                        "stop_loss": float(stop_loss),
+                                        "target_price": float(target_level),
+                                        "rr_ratio": float(rr),
+                                        "atr": float(atr_i),
+                                        "htf_bias": bias,
+                                        "candle_body_ratio": float(candle_body_ratio),
+                                        "swing_level_swept": float(swept_level),
+                                        "swing_level_swept_index": df.index[swept_pos],
+                                        "target_swing_level": float(target_level),
+                                        "target_swing_index": df.index[target_pos],
+                                        "displacement_atr_mult": float(displacement_atr_mult),
+                                        "displacement_bars": int(displacement_bars),
+                                        "sweep_buffer_pct": float(sweep_buffer_pct),
+                                    }
+                                )
+                            else:
+                                short_targets_none += 1
+                                if debug and short_targets_none <= 1:
+                                    within_mask = (
+                                        (low_positions <= pivot_threshold_pos)
+                                        & (low_values < entry_price)
+                                        & ((entry_price - low_values) <= float(target_max_distance_atr_mult) * atr_i)
+                                    )
+                                    num_cands = int(within_mask.sum())
+                                    min_cand = float(np.min(low_values[within_mask])) if num_cands > 0 else None
+                                    print(
+                                        f"DEBUG TARGET SHORT NONE: i={i} swept_level={float(swept_level)} entry={entry_price} atr={atr_i} "
+                                        f"cands_within={num_cands} min_cand={min_cand}"
+                                    )
+
+        if debug and i % 200 == 0:
+            logger_msg = f"DEBUG strategy progress i={i}/{len(df)} signals={len(signals)}"
+            print(logger_msg)
+
+    if debug:
+        print(f"DEBUG: Respected low count={int(respected_low.sum())} respected_high count={int(respected_high.sum())}")
+        if htf_df is not None:
+            # Helps verify HTF bias alignment on the base timeframe.
+            unique_biases = base_bias.value_counts().to_dict()
+            print(f"DEBUG: HTF bias distribution: {unique_biases}")
+        print(
+            f"DEBUG: LONG sweeps={long_sweeps} reversals={long_reversals} sweep+rev={long_sweep_reversals} "
+            f"target_attempts={long_target_search_attempts} targets_found={long_targets_found} targets_none={long_targets_none} "
+            f"chase_rejects={long_chase_rejects}"
+        )
+        print(
+            f"DEBUG: SHORT sweeps={short_sweeps} reversals={short_reversals} sweep+rev={short_sweep_reversals} "
+            f"target_attempts={short_target_search_attempts} targets_found={short_targets_found} targets_none={short_targets_none} "
+            f"chase_rejects={short_chase_rejects}"
+        )
+        print(f"DEBUG: Generated {len(signals)} signals")
 
     return signals

@@ -111,7 +111,12 @@ async def run_live_loop(
                 await asyncio.sleep(live_config.poll_interval_sec)
                 continue
 
-            signals = generate_signals(df, htf_df)
+            signals = generate_signals(
+                df,
+                htf_df,
+                allow_neutral_htf_in_backtest=False,
+                debug=False,
+            )
             if not signals:
                 await asyncio.sleep(live_config.poll_interval_sec)
                 continue

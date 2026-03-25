@@ -62,12 +62,16 @@ def main() -> None:
     out_dir = os.path.join("backtests", datetime.now(tz=timezone.utc).strftime("%Y-%m-%d"))
     os.makedirs(out_dir, exist_ok=True)
 
+    # Windows doesn't allow ":" in regular filenames; without sanitizing it may create
+    # alternate data streams and make the file appear empty.
+    safe_symbol = args.symbol.replace("/", "-").replace(":", "-")
+
     trade_journal = result["trade_journal"]
     if isinstance(trade_journal, pd.DataFrame) and not trade_journal.empty:
-        trade_path = os.path.join(out_dir, f"{args.symbol.replace('/', '-')}_trades.csv")
+        trade_path = os.path.join(out_dir, f"{safe_symbol}_trades.csv")
         trade_journal.to_csv(trade_path, index=False)
 
-    metrics_path = os.path.join(out_dir, f"{args.symbol.replace('/', '-')}_metrics.txt")
+    metrics_path = os.path.join(out_dir, f"{safe_symbol}_metrics.txt")
     with open(metrics_path, "w", encoding="utf-8") as f:
         for k, v in result.items():
             if k in {"equity_curve", "trade_journal"}:
@@ -80,7 +84,9 @@ def main() -> None:
         )
     )
 
-    print(result)
+    # Avoid dumping huge equity curves to stdout.
+    summary = {k: v for k, v in result.items() if k not in {"equity_curve", "trade_journal"}}
+    print(summary)
 
 
 if __name__ == "__main__":

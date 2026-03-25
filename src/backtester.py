@@ -18,6 +18,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional
 
+import re
+import time
 import numpy as np
 import pandas as pd
 
@@ -36,7 +38,7 @@ class BacktestConfig:
 
     # How many candles to request if fetching from an exchange (approx).
     # ccxt "limit" caps request size; we may need to page in a full version.
-    fetch_limit: int = 2000
+    fetch_limit: int = 500000
 
 
 def _ohlcv_list_to_df(ohlcv: list[list[Any]]) -> pd.DataFrame:
@@ -97,6 +99,81 @@ def _apply_fees(*, quantity: float, entry_price: float, exit_price: float, fee_p
     return entry_fee + exit_fee
 
 
+def _timeframe_to_milliseconds(timeframe: str) -> int:
+    """
+    Convert a ccxt timeframe like '15m', '1h', '4h', '1d' into milliseconds.
+    """
+    m = re.fullmatch(r"(\d+)\s*([mhdw])", timeframe.strip(), flags=re.IGNORECASE)
+    if not m:
+        raise ValueError(f"Unsupported timeframe format: {timeframe}")
+    qty = int(m.group(1))
+    unit = m.group(2).lower()
+    if unit == "m":
+        return qty * 60_000
+    if unit == "h":
+        return qty * 3_600_000
+    if unit == "d":
+        return qty * 86_400_000
+    if unit == "w":
+        return qty * 7 * 86_400_000
+    raise ValueError(f"Unsupported timeframe unit: {unit}")
+
+
+def fetch_ohlcv_paged(
+    *,
+    exchange_client: Any,
+    symbol: str,
+    timeframe: str,
+    since_ms: int,
+    limit: int,
+    max_bars: Optional[int] = None,
+) -> list[list[Any]]:
+    """
+    Fetch OHLCV via repeated ccxt fetch_ohlcv calls.
+
+    Ensures backtests actually cover the requested history duration.
+    """
+    tf_ms = _timeframe_to_milliseconds(timeframe)
+    now_ms = int(time.time() * 1000)
+
+    all_batches: list[list[Any]] = []
+    next_since = int(since_ms)
+
+    # Avoid infinite loops if the exchange returns the same last candle.
+    last_ts = None
+
+    while next_since < now_ms:
+        batch = exchange_client.fetch_ohlcv(symbol, timeframe, since_ms=next_since, limit=limit)
+        if not batch:
+            break
+
+        all_batches.append(batch)
+        last_ts = batch[-1][0]
+        next_since = int(last_ts) + tf_ms
+
+        if max_bars is not None:
+            current_len = sum(len(b) for b in all_batches)
+            if current_len >= max_bars:
+                break
+
+        # If we don't advance, stop.
+        if last_ts is None:
+            break
+
+    # Flatten + dedupe by timestamp.
+    flat: list[list[Any]] = [row for batch in all_batches for row in batch]
+    flat.sort(key=lambda r: r[0])
+    deduped: list[list[Any]] = []
+    seen_ts: set[int] = set()
+    for row in flat:
+        ts = int(row[0])
+        if ts in seen_ts:
+            continue
+        seen_ts.add(ts)
+        deduped.append(row)
+    return deduped
+
+
 def backtest_symbol(
     *,
     symbol: str,
@@ -114,7 +191,13 @@ def backtest_symbol(
       - fetch_ohlcv(symbol, timeframe, since_ms, limit)
     """
     since_ms = since_ms_for_years(years)
-    ohlcv = exchange_client.fetch_ohlcv(symbol, timeframe, since_ms=since_ms, limit=backtest_config.fetch_limit)
+    ohlcv = fetch_ohlcv_paged(
+        exchange_client=exchange_client,
+        symbol=symbol,
+        timeframe=timeframe,
+        since_ms=since_ms,
+        limit=backtest_config.fetch_limit,
+    )
     df = _ohlcv_list_to_df(ohlcv)
 
     # Resample base timeframe to HTF for market-structure bias.
@@ -130,7 +213,12 @@ def backtest_symbol(
 
     # Generate signals once, then simulate.
     # This avoids recomputing the strategy on each candle.
-    signals = generate_signals(df, htf_df)
+    signals = generate_signals(
+        df,
+        htf_df,
+        allow_neutral_htf_in_backtest=True,
+        debug=True,
+    )
     # Sort signals by their candle time.
     signals = sorted(signals, key=lambda s: s["signal_index"])
 
@@ -149,29 +237,43 @@ def backtest_symbol(
         equity_curve.append(equity_mark)
 
         # Open a trade if we have a signal at this exact candle.
+        opened_this_candle = False
         while current_signal_ptr < len(signals) and signal_times[current_signal_ptr] == ts:
             if open_trade is None:
                 sig = signals[current_signal_ptr]
                 # Risk sizing based on current equity at entry.
-                planned = plan_trade(signal=sig, equity=equity, risk_config=risk_config)
-                entry_exec = _adverse_fill_price(
-                    price=planned["entry_price"],
-                    side=planned["side"],
-                    slippage_pct=backtest_config.slippage_pct,
-                )
-                open_trade = {
-                    "direction": planned["direction"],
-                    "qty": float(planned["quantity"]),
-                    "entry_price_theoretical": float(planned["entry_price"]),
-                    "entry_exec_price": float(entry_exec),
-                    "stop_loss": float(planned["stop_loss"]),
-                    "target_price": float(planned["target_price"]),
-                    "signal": sig,
-                    "entry_ts": ts,
-                }
+                # plan_trade raises ValueError when RR < min_rr; skip those signals.
+                try:
+                    planned = plan_trade(signal=sig, equity=equity, risk_config=risk_config)
+                except ValueError:
+                    planned = None
+
+                if planned is not None:
+                    entry_exec = _adverse_fill_price(
+                        price=planned["entry_price"],
+                        side=planned["side"],
+                        slippage_pct=backtest_config.slippage_pct,
+                    )
+                    open_trade = {
+                        "direction": planned["direction"],
+                        "qty": float(planned["quantity"]),
+                        "entry_price_theoretical": float(planned["entry_price"]),
+                        "entry_exec_price": float(entry_exec),
+                        "stop_loss": float(planned["stop_loss"]),
+                        "target_price": float(planned["target_price"]),
+                        "signal": sig,
+                        "entry_ts": ts,
+                    }
+                    opened_this_candle = True
             current_signal_ptr += 1
 
         if open_trade is None:
+            continue
+
+        # If we just entered on this candle, we cannot also assume stop/target
+        # executions occurred intrabar on the same candle (we assume entry happens
+        # at the signal candle close, then monitoring begins next candle).
+        if opened_this_candle:
             continue
 
         # Check stop/target hits using candle extremes.
@@ -238,6 +340,10 @@ def backtest_symbol(
                 "entry_exec_price": entry_exec,
                 "exit_price": exit_theoretical,
                 "exit_exec_price": exit_exec,
+                "exit_candle_high": candle_high,
+                "exit_candle_low": candle_low,
+                "hit_stop": hit_stop,
+                "hit_target": hit_target,
                 "stop_loss": stop_loss,
                 "target_price": target_price,
                 "exit_reason": exit_reason,
