@@ -1,0 +1,9 @@
+ccxt>=4.3.0
+pandas
+numpy
+pandas_ta
+python-dotenv
+loguru
+asyncio
+python-telegram-bot  # optional for notifications
+vectorbt  # or backtrader
